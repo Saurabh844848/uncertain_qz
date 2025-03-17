@@ -64,7 +64,7 @@ class GraphConstructionDiscretization:
             node_positions[node_index:node_index + num_points_per_circle, 2] = circle_index
             
             for j in range(num_points_per_circle):
-                key = (x_vals[j], y_vals[j], circle_index, self.q_act)
+                key = (x_vals[j], y_vals[j], circle_index)
                 index_map[key] = node_index + j
                 reverse_index_map[node_index + j] = key
             node_index += num_points_per_circle
@@ -109,7 +109,7 @@ class GraphConstructionDiscretization:
         Returns:
             bool: True if the segment intersects the circle, False otherwise.
         """
-        center_x, center_y, radius, radius_in, risk_limit, toggle = circle
+        center_x, center_y, radius, risk_limit = circle
         x1, y1 = point1
         x2, y2 = point2
         return self.point_to_segment_distance(center_x, center_y, x1, y1, x2, y2) < radius
@@ -154,92 +154,82 @@ class GraphConstructionDiscretization:
             networkx.Graph: The updated visibility graph.
         """
         distance = np.linalg.norm(np.array(node_i[:2]) - np.array(node_j[:2]))
-        soc_i, soc_j = int(node_i[3]), int(node_j[3])
+        
+        ## Only electric lambda
         
         # Retrieve circle parameters corresponding to node_i (assumes node_i[2] is valid)
         circle = self.map_qz[int(node_i[2] - 1)]
-        _, _, radius, radius_in, risk_limit, toggle = circle
+        _, _, radius, risk_limit= circle
         pen_dist = abs(sp.sqrt(radius**2 - (distance / 2)**2))
-        # print(f"pen_dist:{pen_dist}")
-        if pen_dist < radius_in and toggle==0:
-            feasible = False
-        elif pen_dist < radius_in and toggle==1:
-            feasible, lamb, line_segment = self._compute_edge_parameters(soc_i, soc_j, distance)
-            r_minus, r_plus = 0.5 - radius_in/(2*radius), 0.5 + radius_in/(2*radius)
-            l_minus, l_plus = line_segment["e"]
-            electric_len_req = 2*sp.sqrt(radius_in**2 - pen_dist**2)
-            
-            if (l_plus-l_minus) >= electric_len_req and feasible:
-                if (l_minus <= r_minus) and (l_plus >= r_plus):
-                    feasible = True
-                elif (l_minus >= r_minus) and (l_plus >= r_plus):
-                    line_segment["g"] = (0, r_minus)
-                    line_segment["e"] = (r_minus, r_minus+(l_plus-l_minus))
-                    line_segment["g2"] = (r_minus+(l_plus-l_minus), 1)
-                else:
-                    feasible = False
-            else:
-                feasible = False
-        else:
-            feasible, lamb, line_segment = self._compute_edge_parameters(soc_i, soc_j, distance)
-            
-        if feasible:
-            cost = lamb * distance
-            risk_cost = self._compute_risk_cost(line_segment, pen_dist, distance)
-            visibility_graph.add_edge(
-                i, j,
-                node_i_info=node_i,
-                node_j_info=node_j,
-                line_segment=line_segment,
-                fuel_cost=cost,
-                risk_cost=risk_cost,
-                feasibility=feasible,
-                edge_type="internal"
-                )
-        return visibility_graph
-
-    def _compute_risk_cost(self, line_segment, pen_dist, distance):
-        """
-        Computes the risk cost for an internal edge based on the line segment parameters.
         
-        Args:
-            line_segment (dict): Contains segments with keys (e.g. "g", "e").
-            pen_dist: Penetration distance (symbolic) computed from the circle.
-            distance (float): Euclidean distance between the two nodes.
-            
-        Returns:
-            risk_cost (sympy expression): The computed risk cost.
-        """
         risk_cost = 0
         constant_factor = 30
         factor = 1 / (pen_dist + 0.01)
+        delta_theta = risk_limit*pen_dist/constant_factor
+        electric_length = 0
+        theta_pen = sp.acos(pen_dist/radius)
+        only_electric_lambda = []
+        theta = theta_pen - delta_theta
+        if theta <= 0:
+            theta = 0
+            only_electric_lambda = []
+            electric_length = 0
+        else:
+            electric_length= pen_dist*sp.sin(theta)
+            only_electric_lambda = [0.5 - only_electric_lambda/(distance/2), 0.5 + only_electric_lambda/(distance/2)]
         
-        for key, (lamb_start, lamb_end) in line_segment.items():
-            if key == "e":
-                continue  # 'e' segments do not contribute to risk cost
-            elif key.startswith("g"):
-                if lamb_start <= 0.5 <= lamb_end:
-                    risk_cost += abs(
-                        factor * (
-                            sp.atan((distance/2 - lamb_start * distance) / (pen_dist + 0.01)) +
-                            sp.atan((lamb_end * distance - distance/2) / (pen_dist + 0.01))
-                        )
-                    )
-                elif lamb_start >= 0.5:
-                    risk_cost += abs(
-                        factor * (
-                            sp.atan((lamb_end * distance - distance/2) / (pen_dist + 0.01)) -
-                            sp.atan((lamb_start * distance - distance/2) / (pen_dist + 0.01))
-                        )
-                    )
-                elif lamb_end <= 0.5:
-                    risk_cost += abs(
-                        factor * (
-                            sp.atan((distance/2 - lamb_start * distance) / (pen_dist + 0.01)) -
-                            sp.atan((distance/2 - lamb_end * distance) / (pen_dist + 0.01))
-                        )
-                    )
-        return constant_factor * risk_cost
+        visibility_graph.add_edge(
+                i, j,
+                node_i_info=node_i,
+                node_j_info=node_j,
+                only_electric_length = 2*electric_length,
+                edge_type="internal"
+            )
+                
+        return visibility_graph
+
+    # def _compute_risk_cost(self, line_segment, pen_dist, distance):
+    #     """
+    #     Computes the risk cost for an internal edge based on the line segment parameters.
+        
+    #     Args:
+    #         line_segment (dict): Contains segments with keys (e.g. "g", "e").
+    #         pen_dist: Penetration distance (symbolic) computed from the circle.
+    #         distance (float): Euclidean distance between the two nodes.
+            
+    #     Returns:
+    #         risk_cost (sympy expression): The computed risk cost.
+    #     """
+    #     risk_cost = 0
+    #     constant_factor = 30
+    #     factor = 1 / (pen_dist + 0.01)
+        
+    #     for key, (lamb_start, lamb_end) in line_segment.items():
+    #         if key == "e":
+    #             continue  # 'e' segments do not contribute to risk cost
+    #         elif key.startswith("g"):
+    #             if lamb_start <= 0.5 <= lamb_end:
+    #                 risk_cost += abs(
+    #                     factor * (
+    #                         sp.atan((distance/2 - lamb_start * distance) / (pen_dist + 0.01)) +
+    #                         sp.atan((lamb_end * distance - distance/2) / (pen_dist + 0.01))
+    #                     )
+    #                 )
+    #             elif lamb_start >= 0.5:
+    #                 risk_cost += abs(
+    #                     factor * (
+    #                         sp.atan((lamb_end * distance - distance/2) / (pen_dist + 0.01)) -
+    #                         sp.atan((lamb_start * distance - distance/2) / (pen_dist + 0.01))
+    #                     )
+    #                 )
+    #             elif lamb_end <= 0.5:
+    #                 risk_cost += abs(
+    #                     factor * (
+    #                         sp.atan((distance/2 - lamb_start * distance) / (pen_dist + 0.01)) -
+    #                         sp.atan((distance/2 - lamb_end * distance) / (pen_dist + 0.01))
+    #                     )
+    #                 )
+    #     return constant_factor * risk_cost
 
     def build_visibility_graph(self, rev_index_map):
         """
