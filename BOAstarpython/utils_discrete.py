@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import sympy as sp
 import networkx as nx
 import heapq
+from sklearn.cluster import KMeans
+import itertools  # To cycle through style combinations
 
 class GraphConstructionDiscretization:
     """
@@ -16,7 +18,7 @@ class GraphConstructionDiscretization:
         alpha, beta: Parameters for feasibility computations.
         discretization_angle (float): Angle step (in degrees) for discretization.
     """
-    def __init__(self, map_qz, start, goal, q_min, q_max, q_act, alpha, beta, discretization_angle, max_risk_limit, acceptable_risk_limit):
+    def __init__(self, map_qz, start, goal, q_min, q_max, q_act, alpha, beta, discretization_angle, max_risk_limit=np.inf, acceptable_risk_limit=0.0):
         self.map_qz = map_qz
         self.start = start
         self.goal = goal
@@ -28,7 +30,6 @@ class GraphConstructionDiscretization:
         self.discretization_angle = discretization_angle
         self.max_risk_limit = max_risk_limit
         self.acceptable_risk_limit = acceptable_risk_limit
-        
     def create_nodes(self):
         """
         Discretizes the circles and creates nodes with start labeled as "s" and goal as "g".
@@ -525,3 +526,119 @@ def reconstruct_solution_paths(solutions, start_state="s", goal_state="g"):
         path.append(cost)
         solution_paths.append(path)
     return solution_paths
+
+from matplotlib.patches import Circle
+
+def plot_map_with_path(graph_object, Map_qz, start, goal, all_path, reverse_index_map):
+    fig, ax = plt.subplots()
+    fig.set_size_inches(20, 10)
+    
+    ### find the min and max x and y values, for axis limit 
+    min_x = min( [min(Map_qz, key=lambda x: x[0]-x[2])[0] - min(Map_qz, key=lambda x: x[0]-x[2])[2], start[0], goal[0]] )
+    max_x = max( [max(Map_qz, key=lambda x: x[0]+x[2])[0] + max(Map_qz, key=lambda x: x[0]+x[2])[2], start[0], goal[0]] )
+    min_y = min( [min(Map_qz, key=lambda x: x[1]-x[2])[1] - min(Map_qz, key=lambda x: x[1]-x[2])[2], start[1], goal[1]] )
+    max_y = max( [max(Map_qz, key=lambda x: x[1]+x[2])[1] + max(Map_qz, key=lambda x: x[1]+x[2])[2], start[1], goal[1]] )
+    
+    line_styles = ['-', '--', '-.', ':']
+    markers = ['o', 's', '*', '^', 'D', 'v', 'P', 'X', '<', '>', 'H']
+    
+    style_combinations = list(itertools.product(markers, line_styles))
+    
+    path_coordinates = []
+    path_coordinates_gas = []
+    path_coordinates_electric = []
+    
+    for index, path in enumerate(all_path):
+        marker, line_style = style_combinations[index]
+
+        for path_index in range(len(path) - 2): # for each node in the path:
+            i = path[path_index]
+            j = path[path_index + 1]
+            info_graph = graph_object.visibility_graph[i][j]
+            node_i_coor = np.array(info_graph['node_i_info'][:2])
+            node_j_coor = np.array(info_graph['node_j_info'][:2])
+            for line_segment_type, line_segment_value in info_graph['line_segment'].items():
+                if line_segment_type[0] == 'g':
+                    temp_coor_1 = list(node_i_coor + line_segment_value[0] * (node_j_coor - node_i_coor))
+                    temp_coor_2 = list(node_i_coor + line_segment_value[1] * (node_j_coor - node_i_coor))
+                    result = [list(pair) for pair in zip(temp_coor_1, temp_coor_2)]
+                    path_coordinates_gas.append(result)
+                elif line_segment_type[0] == 'e':
+                    temp_coor_1 = list(node_i_coor + line_segment_value[0] * (node_j_coor - node_i_coor))
+                    temp_coor_2 = list(node_i_coor + line_segment_value[1] * (node_j_coor - node_i_coor))
+                    result = [list(pair) for pair in zip(temp_coor_1, temp_coor_2)]
+                    path_coordinates_electric.append(result)
+        
+        ### Draw the path
+        for path_coor in path_coordinates_gas:
+            ax.plot(path_coor[0], path_coor[1], 'r', linestyle=line_style, marker=marker, markersize=3)
+        for path_coor in path_coordinates_electric:
+            ax.plot(path_coor[0], path_coor[1], 'g', linestyle=line_style, marker=marker, markersize=3)
+    
+    for circle_info in Map_qz:
+        # Create a circle patch
+        circle_outer = Circle((circle_info[0], circle_info[1]), radius=circle_info[2], fill=True, facecolor=(0, 0, 1, 0.2), edgecolor='blue', linewidth=2, zorder=1)
+        circle_inner = Circle((circle_info[0], circle_info[1]), radius=circle_info[3], fill=True, facecolor=(0, 0, 0, 0.5), edgecolor='black', linewidth=2, zorder=2)
+
+        # Add the circle to the Axes
+        ax.add_patch(circle_inner)
+        ax.add_patch(circle_outer)
+
+    # Set equal aspect so circles look circular
+    ax.set_aspect('equal', 'box')        
+    
+    # Set axis limits
+    ax.set_xlim(min_x - (max_x - min_x)/10, max_x + (max_x - min_x)/10)
+    ax.set_ylim(min_y - (max_y - min_y)/10, max_y + (max_y - min_y)/10)
+
+    # Plot the start and goal points
+    ax.plot(start[0], start[1], 'ro', label='Start')
+    ax.plot(goal[0], goal[1], 'go', label='Goal')
+
+    # Add a legend
+    ax.legend()
+    plt.title("Pareto optimal paths")
+    plt.grid()
+    plt.show()
+    
+def sample_representative_paths(path_sorted, num_path):
+    # If we only need 2 points, return min and max.
+    if num_path <= 2:
+        return [path_sorted[0], path_sorted[-1]]
+    
+    fuel_costs_arr = np.array([path[-1][0] for path in path_sorted])
+
+    # Reshape the data for k-means clustering (n_samples, n_features)
+    X = fuel_costs_arr.reshape(-1, 1)
+    
+    # Run k-means with the desired number of clusters
+    kmeans = KMeans(n_clusters=num_path, random_state=0)
+    kmeans.fit(X)
+    centers = kmeans.cluster_centers_.flatten()
+    labels = kmeans.labels_
+    
+    # For each cluster, select the data point closest to its center.
+    representatives = []
+    for cluster in range(num_path):
+        # Find indices of data points in the current cluster
+        cluster_indices = np.where(labels == cluster)[0]
+        if len(cluster_indices) == 0:
+            continue  # This cluster got no points, skip it.
+        cluster_points = fuel_costs_arr[cluster_indices]
+        # Compute the absolute difference from the cluster center
+        diff = np.abs(cluster_points - centers[cluster])
+        # Select the point closest to the center
+        rep  = cluster_points[np.argmin(diff)]
+        representatives.append(rep)
+    
+    # Sort the representative points to maintain order
+    representatives = np.array(representatives)
+    representatives.sort()
+    
+    # Force inclusion of extreme values (min and max)
+    representatives[0] = path_sorted[0][-1][0]
+    representatives[-1] = path_sorted[-1][-1][0]
+    
+    ### Get the sampled representative path
+    representative_paths =  [ path_sorted[int(np.where(fuel_costs_arr == fuel_cost_rep)[0][0])] for fuel_cost_rep in representatives ]
+    return representative_paths
