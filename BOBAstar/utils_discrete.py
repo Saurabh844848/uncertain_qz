@@ -340,94 +340,27 @@ class GraphConstructionDiscretization:
         Assigns a heuristic cost for each node based on its Euclidean distance to the goal.
         
         Args:
-            visibility_graph: The graph with nodes.
             rev_index_map: Mapping from node index to node tuple.
-            goal: Goal point as (x, y).
-            qz_circles: List of QZ circles.
-            q_act: The state-of-charge value.
-            alpha: UAV parameter.
-            beta: UAV parameter.
         """
         # Define the goal node tuple. The circle index for the goal is set to len(qz_circles)+1.
         goal_node = (self.goal[0], self.goal[1], len(self.map_qz) + 1, self.q_act)
+        start_node= (self.start[0], self.start[1], 0, self.q_act)
+        
         for i, node in rev_index_map.items():
             # Compute Euclidean distance using sympy (for consistency with the rest of the code)
-            distance = sp.sqrt((goal_node[0] - node[0])**2 + (goal_node[1] - node[1])**2)
-            heuristic_cost = (self.alpha / (self.alpha + self.beta)) * distance
-            self.visibility_graph.nodes[i]['heuristic_cost'] = heuristic_cost
+            distance_goal = sp.sqrt((goal_node[0] - node[0])**2 + (goal_node[1] - node[1])**2)
+            distance_start = sp.sqrt((start_node[0] - node[0])**2 + (start_node[1] - node[1])**2)
+            heuristic_cost_forward = (self.alpha / (self.alpha + self.beta)) * distance_goal
+            heuristic_cost_backward = (self.alpha / (self.alpha + self.beta)) * distance_start
+            
+            self.visibility_graph.nodes[i]['heuristic_cost'] = { "forward": {"fuel_cost": heuristic_cost_forward, "risk_cost": 0}, "backward": {"fuel_cost": heuristic_cost_backward, "risk_cost": 0}  }
+            self.visibility_graph.nodes[i]['upper_bound_cost'] = { "forward": {"fuel_cost": np.inf, "risk_cost": np.inf}, "backward": {"fuel_cost": np.inf, "risk_cost": np.inf}  }
 
-
-# =============================================================================
-# Biobjective Optimization (Search)
-# =============================================================================
-# visibility_graph = graph_object.visibility_graph
-
-def biobjective_search( graph_object, start_state="s", goal_state="g", reduce_factor=0.9):
+class BidictionalSearch():
     """
-    Performs a biobjective search (fuel cost and risk cost) over the visibility graph.
-    
-    Args:
-        graph_object: The graph object containing the visibility graph, and other relevant information.
-        start_state: Identifier for the start node (default "s").
-        goal_state: Identifier for the goal node (default "g").
-        reduce_factor: A factor used in pruning dominated paths.
-        
-    Returns:
-        sols: A dict mapping each state to a list of solution tuples.
-        g2_min: A dict mapping each state to its minimum risk cost.
+    Contains all the functions for the bidirectional biobjective A* search.
     """
-    visibility_graph = graph_object.visibility_graph
-    max_risk_limit, acceptable_risk_limit = graph_object.max_risk_limit, graph_object.acceptable_risk_limit
-    
-    all_states = list(visibility_graph.nodes)
-    # print("All states:", all_states)
-    sols = {state: [] for state in all_states}
-    g2_min = {state: np.inf for state in all_states}
-    open_set = []
-
-    # The start node is represented as a tuple: (f1, f2, g1, g2, state)
-    # and its parent is set to None.
-    start_node = (0, 0, 0, 0, start_state)
-    heapq.heappush(open_set, [start_node, (None, None, None, None, None)])
-
-    while open_set:
-        current_node, parent_node = heapq.heappop(open_set)
-        current_f1, current_f2, current_g1, current_g2, current_state = current_node
-
-        # Prune if the current risk cost is dominated
-        if (current_g2 >= reduce_factor*g2_min[current_state] or
-            current_f2 >= reduce_factor*g2_min[goal_state]):
-            continue
-        
-        g2_min[current_state] = current_g2
-        sols[current_state].append([current_node, parent_node])
-
-        if current_state == "g" and current_g2 < acceptable_risk_limit:
-            return sols, g2_min
-        
-        # Stop expanding if the goal is reached
-        if current_state == goal_state:
-            continue
-
-        # Expand successors of the current state
-        for successor in visibility_graph.successors(current_state):
-            edge_data = visibility_graph.edges[current_state, successor]
-            g1 = current_g1 + edge_data['fuel_cost']
-            f1 = g1 + visibility_graph.nodes[successor]['heuristic_cost']
-            g2 = current_g2 + edge_data['risk_cost']
-            # For risk, we use a zero heuristic.
-            f2 = g2
-
-            # Prune dominated successors
-            if (g2 >= reduce_factor * g2_min[successor] or
-                f2 >= reduce_factor * g2_min[goal_state]) or (current_g2 > max_risk_limit):
-                continue
-
-            child_node = (f1, f2, g1, g2, successor)
-            heapq.heappush(open_set, [child_node, current_node])
-    
-    return sols, g2_min
-
+    def __init__(self, ):
 def extract_costs(solutions, target_state):
     """
     Extracts fuel and risk cost values for a given target state from the solutions.
@@ -440,8 +373,8 @@ def extract_costs(solutions, target_state):
         fuel_costs: List of fuel cost values.
         risk_costs: List of risk cost values.
     """
-    fuel_costs = [sol[0][0] for sol in solutions[target_state]]
-    risk_costs = [sol[0][1] for sol in solutions[target_state]]
+    fuel_costs = [sol[0][0] for sol in solutions]
+    risk_costs = [sol[0][1] for sol in solutions]
     return fuel_costs, risk_costs
 
 
@@ -531,7 +464,7 @@ from matplotlib.patches import Circle
 
 def plot_map_with_path(graph_object, Map_qz, start, goal, all_path, reverse_index_map):
     fig, ax = plt.subplots()
-    fig.set_size_inches(15, 15)
+    fig.set_size_inches(20, 10)
     
     ### find the min and max x and y values, for axis limit 
     min_x = min( [min(Map_qz, key=lambda x: x[0]-x[2])[0] - min(Map_qz, key=lambda x: x[0]-x[2])[2], start[0], goal[0]] )
