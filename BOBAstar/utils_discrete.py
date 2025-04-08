@@ -5,6 +5,8 @@ import networkx as nx
 import heapq
 from sklearn.cluster import KMeans
 import itertools  # To cycle through style combinations
+import threading
+import time
 
 class GraphConstructionDiscretization:
     """
@@ -356,11 +358,541 @@ class GraphConstructionDiscretization:
             self.visibility_graph.nodes[i]['heuristic_cost'] = { "forward": {"fuel_cost": heuristic_cost_forward, "risk_cost": 0}, "backward": {"fuel_cost": heuristic_cost_backward, "risk_cost": 0}  }
             self.visibility_graph.nodes[i]['upper_bound_cost'] = { "forward": {"fuel_cost": np.inf, "risk_cost": np.inf}, "backward": {"fuel_cost": np.inf, "risk_cost": np.inf}  }
 
-class BidictionalSearch():
+class Bidirectional_Biobjective_Class():
     """
     Contains all the functions for the bidirectional biobjective A* search.
     """
-    def __init__(self, ):
+    def __init__(self, graph_object, start_state, goal_state, upper_bounds_global):
+        self.graph_object = graph_object
+        self.start_state = start_state
+        self.goal_state = goal_state
+        self.upper_bounds_global = upper_bounds_global
+        self.ub_lock = threading.Lock()
+    
+    def update_global_upper_bound(self, key, upper_bounds, new_value):
+        # Thread-safe update of an upper bound.
+        with self.ub_lock:
+            if new_value < upper_bounds[key]:
+                upper_bounds[key] = new_value
+
+    def update_upper_bound(self, state, upper_bound, Type="forward", Cost_type="fuel_cost"):
+        # Thread-safe update of an upper bound.
+        with self.ub_lock:
+            self.graph_object.visibility_graph.nodes[state]["upper_bound_cost"][Type][Cost_type] = upper_bound
+
+    def update_heuristic(self, state, heuristic, Type="backward", Cost_type="fuel_cost"):
+        # Thread-safe update of an upper bound.
+        with self.ub_lock:
+            self.graph_object.visibility_graph.nodes[state]["heuristic_cost"][Type][Cost_type] = heuristic
+        
+    ### Cost_Bounded_forward_Astar
+    ### Cost_type = 1 for fuel cost, 2 for risk cost
+    def Cost_Bounded_forward_Astar_f1f2(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f1min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f1, g1, f2, g2, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.start_state))
+        
+        while open_list:
+            current_f1, current_g1, current_f2, current_g2, current_state = heapq.heappop(open_list)
+            
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.goal_state:
+                    self.update_global_upper_bound("ub2forward", self.upper_bounds_global, current_g2)
+                    self.update_heuristic( current_state, current_g1, Type="backward", Cost_type="fuel_cost")
+                    f1min[current_state] = current_g1
+                    closed.append(current_state)
+                    print(f"The ub2forward is updated to {self.upper_bounds_global['ub2forward']}, and goal_g1 is {current_g1}")
+                    print(f"fuel cost to goal: {current_g1}, risk cost to goal: {current_g2}")
+                    continue
+                
+                ### Check whether the current state exceeds the global upper bound
+                with self.ub_lock:
+                    ub_g1_forward = self.upper_bounds_global["ub1forward"]
+                    ub_g2_forward = self.upper_bounds_global["ub2forward"]
+                
+                # if current_g1 > ub_g1_forward or current_g2 > ub_g2_forward:
+                #     ### Bascially path from this node is not feasible
+                #     update_heuristic(graph_object, current_state, np.inf, Type="backward", Cost_type="fuel_cost")
+                #     closed.append(current_state)
+                #     continue
+                
+                ### Update the heuristic
+                self.update_heuristic(current_state, current_g1, Type="backward", Cost_type="fuel_cost")
+                ### As this a new state not in closed list, this is the min cost1 for this state, thus we can upper bound the cost2 for this state 
+                self.update_upper_bound(current_state, current_g2, Type="forward", Cost_type="risk_cost")
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        with self.ub_lock:
+                            edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                            node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["forward"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["forward"]["risk_cost"]
+                        
+                        ### If the f1 and f2 values of the successor exceed the global upper bound, skip it
+                        # if successor_f1 > ub_g1_forward or successor_f2 > ub_g2_forward:
+                        #     update_heuristic(graph_object, successor, np.inf, Type="backward", Cost_type="fuel_cost")
+                        #     continue
+                        #
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f1 < f1min[successor]:
+                            f1min[successor] = successor_f1
+                            heapq.heappush(open_list, (successor_f1, successor_g1, successor_f2, successor_g2, successor))
+                        
+                closed.append(current_state)
+
+    ### Cost_Bounded_forward_Astar
+    ### Cost_type = 1 for fuel cost, 2 for risk cost
+    def Cost_Bounded_backward_Astar_f2f1(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f2min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f1, g1, f2, g2, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
+        
+        while open_list:
+            current_f2, current_g2, current_f1, current_g1, current_state = heapq.heappop(open_list)
+            
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.start_state:
+                    self.update_global_upper_bound("ub1backward", self.upper_bounds_global, current_g1)
+                    self.update_heuristic(current_state, current_g2, Type="forward", Cost_type="risk_cost")
+                    f2min[current_state] = current_g2
+                    closed.append(current_state)
+                    print(f"The ub1backward is updated to {self.upper_bounds_global['ub1backward']}, and goal_g2 is {current_g2}")
+                    continue
+                
+                with self.ub_lock:
+                    ub_f1_backward = self.upper_bounds_global["ub1backward"]
+                    ub_f2_backward = self.upper_bounds_global["ub2backward"]
+                
+                ### Check whether the current state exceeds the global upper bound
+                # if current_f1 > ub_f1_backward or current_f2 > ub_f2_backward:
+                #     ### Bascially path from this node is not feasible
+                #     update_heuristic(graph_object, current_state, np.inf, Type="forward", Cost_type="risk_cost")
+                #     closed.append(current_state)
+                #     continue
+                
+                self.update_heuristic(current_state, current_g2, Type="forward", Cost_type="risk_cost")
+                ### As this a new state not in closed list, this is the min cost2 for this state, thus we can upper bound the cost1 for this state 
+                self.update_upper_bound(current_state, current_g1, Type="backward", Cost_type="fuel_cost")
+                
+                # ### Check whether the current state exceeds the local upper bound
+                # if current_g1 > graph_object.visibility_graph[current_state]["upper_bound"]["forward"] or current_g2 > graph_object.visibility_graph[current_state]["upper_bound"]["forward"]:
+                #     ### Path possible from this this node, but the current path won't be parato optimal
+                #     continue
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        with self.ub_lock:
+                            edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                            node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["backward"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["backward"]["risk_cost"]
+                        
+                        ### If the f1 and f2 values of the successor exceed the global upper bound, skip it
+                        # if successor_f1 > ub_f1_backward or successor_f2 > ub_f2_backward:
+                        #     update_heuristic(graph_object, successor, np.inf, Type="forward", Cost_type="risk_cost")
+                        #     continue
+                        
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f2 < f2min[successor]:
+                            f2min[successor] = successor_f2
+                            heapq.heappush(open_list, ( successor_f2, successor_g2, successor_f1, successor_g1, successor))
+                        
+                closed.append(current_state)
+
+    ## Cost_Bounded_forward_Astar
+    ## Cost_type = 1 for fuel cost, 2 for risk cost
+    def Cost_Bounded_forward_Astar_f2f1(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f2min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f2, g2, f1, g1, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.start_state))
+        
+        while open_list:
+            current_f2, current_g2, current_f1, current_g1, current_state = heapq.heappop(open_list)
+            
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.goal_state:
+                    self.update_global_upper_bound("ub1forward", self.upper_bounds_global, current_g1)
+                    print(f"The current g1 is {current_g1} and current g2 is {current_g2}")
+                    self.update_heuristic(current_state, current_g2, Type="backward", Cost_type="risk_cost")
+                    f2min[current_state] = current_g2
+                    closed.append(current_state) 
+                    continue
+                
+                ### Check whether the current state exceeds the global upper bound
+                with self.ub_lock:
+                    ub_g1_forward = self.upper_bounds_global["ub1forward"]
+                    ub_g2_forward = self.upper_bounds_global["ub2forward"]
+                
+                # if current_g1 > ub_g1_forward or current_g2 > ub_g2_forward:
+                #     ### Bascially path from this node is not feasible
+                #     update_heuristic(graph_object, current_state, np.inf, Type="backward", Cost_type="risk_cost")
+                #     closed.append(current_state)
+                #     continue
+                
+                self.update_heuristic(current_state, current_g2, Type="backward", Cost_type="risk_cost")
+                ### As this a new state not in closed list, this is the min cost2 for this state, thus we can upper bound the cost1 for this state 
+                self.update_upper_bound(current_state, current_g1, Type="forward", Cost_type="fuel_cost")
+                
+                # ### Check whether the current state exceeds the local upper bound
+                # if current_g1 > graph_object.visibility_graph[current_state]["upper_bound"]["forward"] or current_g2 > graph_object.visibility_graph[current_state]["upper_bound"]["forward"]:
+                #     ### Path possible from this this node, but the current path won't be parato optimal
+                #     continue
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        with self.ub_lock:
+                            edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                            node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["forward"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["forward"]["risk_cost"]
+                        
+                        ### If the f1 and f2 values of the successor exceed the global upper bound, skip it
+                        # if successor_f2 > ub_g2_forward or successor_f2 > ub_g2_forward:
+                        #     update_heuristic(graph_object, successor, np.inf, Type="backward", Cost_type="risk_cost")
+                        #     continue
+                        
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f2 < f2min[successor]:
+                            f2min[successor] = successor_f2
+                            heapq.heappush(open_list, (successor_f2, successor_g2, successor_f1, successor_g1, successor))
+
+                closed.append(current_state)
+
+    ## Cost_Bounded_forward_Astar
+    ## Cost_type = 1 for fuel cost, 2 for risk cost
+
+    def Cost_Bounded_backward_Astar_f1f2(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f1min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f1, g1, f2, g2, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
+        
+        while open_list:
+            current_f1, current_g1, current_f2, current_g2, current_state = heapq.heappop(open_list)
+            
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.start_state:
+                    self.update_global_upper_bound("ub2backward", self.upper_bounds_global, current_g2)
+                    self.update_heuristic(current_state, current_g1, Type="forward", Cost_type="fuel_cost")
+                    print(f"The current g1 is {current_g1} and current g2 is {current_g2}")
+                    f1min[current_state] = current_g1
+                    closed.append(current_state) 
+                    continue
+                
+                with self.ub_lock:
+                    ub_f1_backward = self.upper_bounds_global["ub1backward"]
+                    ub_f2_backward = self.upper_bounds_global["ub2backward"]
+                
+                ### Check whether the current state exceeds the global upper bound
+                # if current_g1 > ub_f1_backward or current_g2 > ub_f2_backward:
+                #     ### Bascially path from this node is not feasible
+                #     update_heuristic(graph_object, current_state, np.inf, Type="forward", Cost_type="fuel_cost")
+                #     closed.append(current_state)
+                #     continue
+                
+                self.update_heuristic(current_state, current_g1, Type="forward", Cost_type="fuel_cost")
+                ### As this a new state not in closed list, this is the min cost2 for this state, thus we can upper bound the cost1 for this state 
+                self.update_upper_bound(current_state, current_g2, Type="backward", Cost_type="risk_cost")
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        with self.ub_lock:
+                            edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                            node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["backward"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["backward"]["risk_cost"]
+                        
+                        ### If the f1 and f2 values of the successor exceed the global upper bound, skip it
+                        # if successor_f1 > ub_f1_backward or successor_f2 > ub_f2_backward:
+                        #     update_heuristic(graph_object, successor, np.inf, Type="forward", Cost_type="fuel_cost")
+                        #     continue
+                        
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f1 < f1min[successor]:
+                            f1min[successor] = successor_f1
+                            heapq.heappush(open_list, ( successor_f1, successor_g1, successor_f2, successor_g2, successor))
+                        
+                closed.append(current_state)
+    
+    ### parallel code:
+    def run_parallel_cost_bounded_astar(self, type="first"):
+        results = {}
+
+        def forward_worker():
+            if type == "first":
+                self.Cost_Bounded_forward_Astar_f1f2()
+            else:
+                self.Cost_Bounded_forward_Astar_f2f1()
+    
+        def backward_worker():
+            # Note: for the backward search, we call start=goal and goal=start,
+            # because we run on the reversed graph.
+            if type == "first":
+                self.Cost_Bounded_backward_Astar_f2f1()
+            else:
+                self.Cost_Bounded_backward_Astar_f1f2()
+        
+        t1 = threading.Thread(target=forward_worker)
+        t2 = threading.Thread(target=backward_worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    
+    def Heuristic_calc_bidirectional(self):
+        start_time = time.time()
+        self.run_parallel_cost_bounded_astar("second")
+        end_time = time.time()
+        print(f"The time req for second heuristic: {end_time-start_time}")
+
+        start_time = time.time()
+        self.run_parallel_cost_bounded_astar("first")
+        end_time = time.time()
+        print(f"The time req for first heuristic: {end_time-start_time}")
+        
+    
+    # Update global best costs only if the new cost is lower.
+    def update_g_min(self, current_state, current_g, type=1):
+        with self.ub_lock:
+            if type == 1:
+                # For fuel cost (g1)
+                if current_g < self.g1_min[current_state]:
+                    older = self.g1_min[current_state]
+                    self.g1_min[current_state] = current_g
+                    # if current_state == "s":
+                    #     # print(f"Updated g1_min for {current_state} from {older} to {g1_min[current_state]}")
+            else:
+                # For risk cost (g2)
+                if current_g < self.g2_min[current_state]:
+                    older = self.g2_min[current_state]
+                    self.g2_min[current_state] = current_g
+                    # if current_state == "g":
+                        # print(f"Updated g2_min for {current_state} from {older} to {g2_min[current_state]}")
+
+    def retrive_g1g2_min(self, current_state, type=1):
+        with self.ub_lock:
+            g1_min_s = self.g1_min["s"]
+            g2_min_g = self.g2_min["g"]
+            if type==1:
+                g_min_curr = self.g1_min[current_state]
+            else:
+                g_min_curr = self.g2_min[current_state]
+        
+        return g1_min_s, g2_min_g, g_min_curr
+
+    def get_heuristic(self, visibility_graph, successor, type= "forward"):
+        with self.ub_lock:
+            h1 = visibility_graph.nodes[successor]['heuristic_cost'][type]["fuel_cost"]
+            h2 = visibility_graph.nodes[successor]['heuristic_cost'][type]["risk_cost"]
+        return h1, h2
+
+    def initialize_global_bounds(self):
+        # Initialize global best cost dictionaries from the graph.
+        all_states = list(self.graph_object.visibility_graph.nodes())
+        g1_min = {state: np.inf for state in all_states}
+        g2_min = {state: np.inf for state in all_states}
+        # For the forward search, the best (fuel) cost for the start is initialized from the backward bound.
+        g1_min[self.start_state] = self.upper_bounds_global["ub1backward"]
+        # For the forward search, the best (risk) cost for the goal is initialized from the forward bound.
+        g2_min[self.goal_state] = self.upper_bounds_global["ub2forward"]
+
+        return g1_min, g2_min
+
+    # Forward biobjective search.
+    def biobjective_search_forward(self, reduce_factor=1):
+        
+        all_states = list(self.graph_object.visibility_graph.nodes())
+        open_set = []
+        sols = {state: [] for state in all_states}
+        
+        # Start node: tuple is (f1, f2, g1, g2, state)
+        start_node = (0, 0, 0, 0, self.start_state)
+        heapq.heappush(open_set, (start_node, (None, None, None, None, None)))
+        
+        while open_set:
+            current_node, parent_node = heapq.heappop(open_set)
+            current_f1, current_f2, current_g1, current_g2, current_state = current_node
+            
+            g1_min_s, g2_min_g, g2_min_curr = self.retrive_g1g2_min(current_state, type=2)
+            
+            # Instead of breaking, we skip nodes whose f1 exceeds the best known solution.
+            if current_f1 > g1_min_s:
+                continue
+            
+            # Prune if this node is dominated in risk.
+            if (current_g2 >= reduce_factor * g2_min_curr or
+                current_f2 >= reduce_factor * g2_min_g):
+                continue
+            
+            # If this state is reached for the first time, update its heuristic.
+            if g2_min_curr == np.inf:
+                self.update_heuristic(current_state, current_g1, Type="backward", Cost_type="fuel_cost")
+            
+            # Update the best risk cost for this state.
+            self.update_g_min(current_state, current_g2, type=2)
+            sols[current_state].append([current_node, parent_node])
+            
+            # If goal reached, do not expand further.
+            if current_state == self.goal_state:
+                # print("Goal state reached with f1:", current_f1, "and f2:", current_f2)
+                continue
+            
+            # Expand successors.
+            for successor in self.graph_object.visibility_graph.successors(current_state):
+                edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                
+                h1, h2 = self.get_heuristic(self.graph_object.visibility_graph, successor, type= "forward")
+                
+                g1 = current_g1 + edge_data['fuel_cost']
+                f1 = g1 + h1
+                g2 = current_g2 + edge_data['risk_cost']
+                f2 = g2 + h2
+                
+                g1_min_s, g2_min_g, g2_min_suc = self.retrive_g1g2_min(successor, type=2)
+                
+                if (g2 >= reduce_factor * g2_min_suc or
+                    f2 >= reduce_factor * g2_min_g):
+                    continue
+                if f1 >= g1_min_s:
+                    continue
+                
+                child_node = (f1, f2, g1, g2, successor)
+                heapq.heappush(open_set, (child_node, current_node))
+                
+        return sols, self.g2_min
+
+    # Backward biobjective search.
+    def biobjective_search_backward(self, reduce_factor=1, g1_min=None, g2_min=None):
+
+        all_states = list(self.graph_object.visibility_graph.nodes())
+        open_set = []
+        sols = {state: [] for state in all_states}
+        
+        # For the backward search, we start at the goal.
+        start_node = (0, 0, 0, 0, "g")
+        heapq.heappush(open_set, (start_node, (None, None, None, None, None)))
+        
+        while open_set:
+            current_node, parent_node = heapq.heappop(open_set)
+            # In backward search the tuple ordering is reversed: (f2, f1, g2, g1, state)
+            current_f2, current_f1, current_g2, current_g1, current_state = current_node
+            
+            g1_min_s, g2_min_g, g1_min_curr = self.retrive_g1g2_min(current_state, type=1)
+            
+            if current_f2 > g2_min_g:
+                continue
+            if (current_g1 >= reduce_factor * g1_min_curr or
+                current_f1 >= reduce_factor * g1_min_s):
+                continue
+            if g1_min_curr == np.inf:
+                self.update_heuristic(current_state, current_g2, Type="forward", Cost_type="risk_cost")
+            
+            self.update_g_min(current_state, current_g1, type=1)
+            sols[current_state].append([current_node, parent_node])
+            
+            if current_state == self.start_state:
+                continue
+            
+            for successor in self.graph_object.visibility_graph.successors(current_state):
+                edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                h1_, h2_ = self.get_heuristic(self.graph_object.visibility_graph, successor, type= "backward")
+                
+                g1 = current_g1 + edge_data['fuel_cost']
+                f1 = g1 + h1_
+                g2 = current_g2 + edge_data['risk_cost']
+                f2 = g2 + h2_
+                
+                g1_min_s, g2_min_g, g1_min_suc = self.retrive_g1g2_min(successor, type=1)
+                
+                if (g1 >= reduce_factor * g1_min_suc or
+                    f1 >= reduce_factor * g1_min_s):
+                    continue
+                if f2 >= g2_min_g:
+                    continue
+                
+                child_node = (f2, f1, g2, g1, successor)
+                heapq.heappush(open_set, (child_node, current_node))
+        
+        return sols, self.g1_min
+
+    # Run the two searches in parallel.
+    def run_parallel_search(self):
+        # Initialize the shared global bounds.
+        self.g1_min, self.g2_min = self.initialize_global_bounds()
+        results = {"forward": None, "backward": None}
+        
+        def forward_worker():
+            sols_forward, _ = self.biobjective_search_forward(reduce_factor=1)
+            # print("Forward search solutions for goal:", sols_forward["g"])
+            results['forward'] = sols_forward["g"]
+            
+        def backward_worker():
+            sols_backward, _ = self.biobjective_search_backward(reduce_factor=1)
+            # print("Backward search solutions for start:", sols_backward["s"])
+            
+            result_list = []
+            for result in sols_backward["s"]:
+                [f2, f1, g1, g2, state], prev = result
+                result_list.append([[f1,f2,g1,g2,state],prev])
+            results['backward'] = result_list
+        
+        t1 = threading.Thread(target=forward_worker)
+        t2 = threading.Thread(target=backward_worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        
+        # Combine solutions from the forward search (for goal) and backward search (for start).
+        combined_sols = results["forward"] + results["backward"]
+        return combined_sols
+
+    def Bidectional_Biobjective_Search(self):
+        # Example usage:
+        # Assume graph_object and upper_bounds_global are already defined.
+        start_time = time.time()
+        sols = self.run_parallel_search()
+        end_time = time.time()
+        print(f"The time required for search: {end_time - start_time}")
+        
+        return sols
+    
 def extract_costs(solutions, target_state):
     """
     Extracts fuel and risk cost values for a given target state from the solutions.

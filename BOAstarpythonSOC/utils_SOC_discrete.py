@@ -16,13 +16,13 @@ class GraphConstructionDiscretization:
         alpha, beta: Parameters for feasibility computations.
         discretization_angle (float): Angle step (in degrees) for discretization.
     """
-    def __init__(self, map_qz, start, goal, q_min, q_max, q_act, alpha, beta, discretization_angle, discretization_SOC, max_risk_limit, acceptable_risk_limit):
+    def __init__(self, map_qz, start, goal, q_min, q_max, alpha, beta, discretization_angle, discretization_SOC, max_risk_limit, acceptable_risk_limit):
         self.map_qz = map_qz
         self.start = start
         self.goal = goal
         self.q_min = q_min
         self.q_max = q_max
-        self.q_act = q_act
+        # self.q_act = q_act
         self.alpha = alpha
         self.beta = beta
         self.discretization_angle = discretization_angle
@@ -55,7 +55,7 @@ class GraphConstructionDiscretization:
             (self.goal[0], self.goal[1], len(self.map_qz) + 1, SOC_charge): i+self.num_SOC for i, SOC_charge in enumerate(self.SOC)
         })
         
-        reverse_index_map = {value: key for key, value in index_map.items()}
+        self.reverse_index_map = {value: key for key, value in index_map.items()}
 
         # Assign start and goal positions in the node array.
         node_positions[:self.num_SOC, 0] = self.start[0]
@@ -84,11 +84,16 @@ class GraphConstructionDiscretization:
             for j in range(num_points_per_circle):
                 key = (x_vals[j], y_vals[j], circle_index, SOC_reps[j])
                 index_map[key] = node_index + j
-                reverse_index_map[node_index + j] = key
+                self.reverse_index_map[node_index + j] = key
+            ### Updating the node index
             node_index += num_points_per_circle
-
+        
+        ### Adding a dummy node for the goal to be used in the path planning
+        index_map[(self.goal[0], self.goal[1], len(self.map_qz) + 1, self.q_min)] = node_index
+        self.reverse_index_map[node_index] = (self.goal[0], self.goal[1], len(self.map_qz) + 1, self.q_min)
         self.node_positions = node_positions
-        return node_positions, index_map, reverse_index_map
+        
+        return node_positions, index_map, self.reverse_index_map
 
     @staticmethod
     def point_to_segment_distance(px, py, x1, y1, x2, y2):
@@ -149,10 +154,13 @@ class GraphConstructionDiscretization:
         
         # Check if the SOC requirements immediately rule out feasibility
         if soc_j > min(self.q_max, soc_i + self.beta * distance):
+            # print(f"Entered because {soc_j} > min({self.q_max}, {soc_i} + self.beta * distance)")
             return feasible, None, line_segment
         
         # If the drop is sufficiently steep that the whole edge is "feasible"
-        if (soc_i - self.alpha * distance) < self.q_min and soc_j <= soc_i - self.alpha * distance:
+        # if (soc_i - self.alpha * distance) < self.q_min and soc_j <= soc_i - self.alpha * distance:
+        if soc_j <= soc_i - self.alpha * distance:
+            # print(f"Seems to be wrong")
             feasible = True
             lamb = 1
             line_segment = {"e": (0, lamb)}
@@ -190,11 +198,12 @@ class GraphConstructionDiscretization:
         """
         distance = np.linalg.norm(np.array(node_i[:2]) - np.array(node_j[:2]))
         for i_add, SOC_i in enumerate(self.SOC):
-            for j_add, SOC_j in enumerate(self.SOC):     
+            for j_add, SOC_j in enumerate(self.SOC):
+                # print(f"i: {i+i_add}, j: {j+j_add}")
                 feasible, lamb, line_segment = self._compute_edge_parameters(SOC_i, SOC_j, distance)
                 # print(f"i: {i+i_add}, j: {j+j_add}")
                 if feasible:
-                    # print(f"i: {i+i_add}, j: {j+j_add}")
+                    # print(f" after fesibility check is true i: {i+i_add}, j: {j+j_add}")
                     cost = lamb * distance
                     visibility_graph.add_edge(
                         i+i_add, j+j_add,
@@ -327,7 +336,7 @@ class GraphConstructionDiscretization:
         # Iterate over all pairs of nodes
         for i in range(0, len(rev_index_map), self.num_SOC):
             for j in range(0, len(rev_index_map), self.num_SOC):
-                if i == j:
+                if i == j or i == len(rev_index_map) - 1 or j == len(rev_index_map) - 1:
                     continue
                 node_i, node_j = rev_index_map[i], rev_index_map[j]
                 
@@ -348,35 +357,53 @@ class GraphConstructionDiscretization:
                     if not intersection_exists:
                         self.external_edge_addition(i, node_i, j, node_j, self.visibility_graph)
 
+        ### Assign the and cost from goal to dummy node as zero 
+        for i in range(self.num_SOC , 2*self.num_SOC):
+            j = len(rev_index_map) - 1
+            node_i, node_j = rev_index_map[i], rev_index_map[j]
+            
+            self.visibility_graph.add_edge(i, j,
+                        node_i_info= (node_i[0], node_i[1], node_i[2], node_i[3]),
+                        node_j_info= (node_j[0], node_j[1], node_j[2], node_j[3]),
+                        line_segment= None,
+                        fuel_cost= 0,
+                        risk_cost= 0,
+                        feasibility= True,
+                        edge_type="external"
+                    )
+            self.visibility_graph.add_edge(j, i,
+                node_j_info= (node_j[0], node_j[1], node_j[2], node_j[3]),
+                node_i_info= (node_i[0], node_i[1], node_i[2], node_i[3]),
+                line_segment= None,
+                fuel_cost= 0,
+                risk_cost= 0,
+                feasibility= True,
+                edge_type="external"
+            )
+        
     def assign_heuristic_costs(self, rev_index_map):
         """
         Assigns a heuristic cost for each node based on its Euclidean distance to the goal.
         
         Args:
-            visibility_graph: The graph with nodes.
             rev_index_map: Mapping from node index to node tuple.
-            goal: Goal point as (x, y).
-            qz_circles: List of QZ circles.
-            q_act: The state-of-charge value.
-            alpha: UAV parameter.
-            beta: UAV parameter.
         """
-        # Define the goal node tuple. The circle index for the goal is set to len(qz_circles)+1.
-        goal_node = (self.goal[0], self.goal[1], len(self.map_qz) + 1, self.q_max)
-        for node in self.visibility_graph.nodes:
-            node_info = rev_index_map[node]
-            # Compute Euclidean distance using sympy (for consistency with the rest of the code)
-            distance = sp.sqrt((goal_node[0] - node_info[0])**2 + (goal_node[1] - node_info[1])**2)
-            heuristic_cost = (self.alpha / (self.alpha + self.beta)) * distance
-            self.visibility_graph.nodes[node]['heuristic_cost'] = heuristic_cost
+        # Define the goal node tuple. The circle index for the goal is set to len(qz_circles)+1. Assume that the goal is reached at q_min. 
+        # In this way, the heuristic cost is the lowest possible.
+        goal_node = (self.goal[0], self.goal[1], len(self.map_qz) + 1, self.q_min)
+        
+        for i, node in rev_index_map.items():
+            if node[2] != len(self.map_qz) + 1:
+                # Compute Euclidean distance using sympy (for consistency with the rest of the code)
+                distance_goal = sp.sqrt((goal_node[0] - node[0])**2 + (goal_node[1] - node[1])**2)
 
+                heuristic_cost_forward = max( ( self.alpha*distance_goal + goal_node[3] - node[3]) / (self.alpha + self.beta) , 0 )            
+                self.visibility_graph.nodes[i]['heuristic_cost'] = {"fuel_cost": heuristic_cost_forward, "risk_cost": 0}
+            else:
+                # print(f" The nodes that are assigned hueristic cost of zero are {node}")
+                self.visibility_graph.nodes[i]['heuristic_cost'] = {"fuel_cost": 0, "risk_cost": 0}
 
-# =============================================================================
-# Biobjective Optimization (Search)
-# =============================================================================
-# visibility_graph = graph_object.visibility_graph
-
-def biobjective_search( graph_object, start_state=2, goal_state=[3,4,5], reduce_factor=1):
+def biobjective_search( graph_object, start_state, goal_state, reduce_factor=0.9):
     """
     Performs a biobjective search (fuel cost and risk cost) over the visibility graph.
     
@@ -403,46 +430,226 @@ def biobjective_search( graph_object, start_state=2, goal_state=[3,4,5], reduce_
     # and its parent is set to None.
     start_node = (0, 0, 0, 0, start_state)
     heapq.heappush(open_set, [start_node, (None, None, None, None, None)])
-    g2_min_goal = np.inf
+
     while open_set:
         current_node, parent_node = heapq.heappop(open_set)
         current_f1, current_f2, current_g1, current_g2, current_state = current_node
-        length_SOC = len(goal_state)
-        g2_min_goal = min( [ value for key, value in g2_min.items() if key in goal_state ] )
+
         # Prune if the current risk cost is dominated
-        print(f"Current_state: {current_state}")
-        if (current_g2 >= reduce_factor * g2_min[current_state] or
-            current_f2 >= reduce_factor * g2_min_goal):
+        if (current_g2 >= reduce_factor*g2_min[current_state] or
+            current_f2 >= reduce_factor*g2_min[goal_state]):
             continue
         
         g2_min[current_state] = current_g2
         sols[current_state].append([current_node, parent_node])
 
-        if current_state in goal_state and current_g2 < acceptable_risk_limit:
-            return sols, g2_min
+        # if current_state == "g" and current_g2 < acceptable_risk_limit:
+        #     return sols, g2_min
         
         # Stop expanding if the goal is reached
-        if current_state in goal_state:
+        if current_state == goal_state:
+            
             continue
 
         # Expand successors of the current state
         for successor in visibility_graph.successors(current_state):
             edge_data = visibility_graph.edges[current_state, successor]
             g1 = current_g1 + edge_data['fuel_cost']
-            f1 = g1 + visibility_graph.nodes[successor]['heuristic_cost']
+            f1 = g1 + visibility_graph.nodes[successor]['heuristic_cost']["fuel_cost"]
             g2 = current_g2 + edge_data['risk_cost']
             # For risk, we use a zero heuristic.
-            f2 = g2
-
+            f2 = g2 + visibility_graph.nodes[successor]['heuristic_cost']["risk_cost"]
+            
+            # print(f"current_state: {current_state}, successor: {successor}, heuristic: {visibility_graph.nodes[successor]['heuristic_cost']}, ")
             # Prune dominated successors
             if (g2 >= reduce_factor * g2_min[successor] or
-                f2 >= reduce_factor * g2_min_goal) or (current_g2 > max_risk_limit):
+                f2 >= reduce_factor * g2_min[goal_state]) or (current_g2 > max_risk_limit):
                 continue
-            
+
             child_node = (f1, f2, g1, g2, successor)
             heapq.heappush(open_set, [child_node, current_node])
-
+    
     return sols, g2_min
+
+class Biobjective_search_and_heuristic_calc_class():
+    """
+    Contains functions for heuristic calculation and biobjective search 
+    """
+    def __init__(self, graph_object, start_state, goal_state):
+        self.graph_object = graph_object
+        self.start_state = start_state
+        self.goal_state = goal_state
+    
+    def update_heuristic(self, state, heuristic, Cost_type="fuel_cost"):
+        # Thread-safe update of an upper bound.
+        # print(f"Updating heuristic for state, state is {state}, {self.graph_object.visibility_graph.nodes[state]}")
+        self.graph_object.visibility_graph.nodes[state]["heuristic_cost"][Cost_type] = heuristic
+
+    ### Cost_Bounded_forward_Astar
+    ### Cost_type = 1 for fuel cost, 2 for risk cost
+    def Cost_Bounded_backward_Astar_f2f1(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f2min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f1, g1, f2, g2, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
+        
+        while open_list:
+            current_f2, current_g2, current_f1, current_g1, current_state = heapq.heappop(open_list)
+            # print(f"current state: {current_state}, current_f2: {current_f2}, current_g2: {current_g2}, current_f1: {current_f1}, current_g1: {current_g1}")
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.start_state:
+                    self.update_heuristic(current_state, current_g2, Cost_type="risk_cost")
+                    f2min[current_state] = current_g2
+                    closed.append(current_state)
+                    continue
+                
+                self.update_heuristic(current_state, current_g2, Cost_type="risk_cost")
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                        node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["risk_cost"]
+                        
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f2 < f2min[successor]:
+                            f2min[successor] = successor_f2
+                            heapq.heappush(open_list, ( successor_f2, successor_g2, successor_f1, successor_g1, successor))
+                        
+                closed.append(current_state)
+
+    def Cost_Bounded_backward_Astar_f1f2(self): 
+        # Initialize the priority queue with the start state.
+        open_list = []
+        closed = []
+        f1min = {node: np.inf for node in self.graph_object.visibility_graph.nodes()}    
+        ### node is of the form (f1, g1, f2, g2, state)
+        heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
+        
+        while open_list:
+            current_f1, current_g1, current_f2, current_g2, current_state = heapq.heappop(open_list)
+            # print(f"current state: {current_state}, current_f2: {current_f2}, current_g2: {current_g2}, current_f1: {current_f1}, current_g1: {current_g1}")
+            if current_state not in closed:
+                ### Check if the current state is the goal state
+                if current_state == self.start_state:
+                    self.update_heuristic(current_state, current_g1, Cost_type="fuel_cost")
+                    f1min[current_state] = current_g1
+                    closed.append(current_state) 
+                    continue
+                
+                self.update_heuristic(current_state, current_g1, Cost_type="fuel_cost")
+                
+                ### Expand successors
+                for successor in self.graph_object.visibility_graph.successors(current_state):
+                    if successor not in closed:
+                        edge_data = self.graph_object.visibility_graph.edges[current_state, successor]
+                        node_data = self.graph_object.visibility_graph.nodes[successor]
+                        
+                        successor_g1 = current_g1 + edge_data["fuel_cost"]
+                        successor_g2 = current_g2 + edge_data["risk_cost"]
+                        
+                        successor_f1 = successor_g1 + node_data["heuristic_cost"]["fuel_cost"]
+                        successor_f2 = successor_g2 + node_data["heuristic_cost"]["risk_cost"]
+
+                        ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
+                        if successor_f1 < f1min[successor]:
+                            f1min[successor] = successor_f1
+                            heapq.heappush(open_list, ( successor_f1, successor_g1, successor_f2, successor_g2, successor))
+                        
+                closed.append(current_state)
+
+    def Heuristic_calc(self):
+        print("Calculating heuristic")
+        self.Cost_Bounded_backward_Astar_f1f2()
+        self.Cost_Bounded_backward_Astar_f2f1()
+    
+    def reduce_factor_calc(self, state, current_f1, f1_min):
+        if f1_min[state] != 0:
+            reduce_factor = (1 - 5*(current_f1 - f1_min[state])/current_f1)
+        else:
+            reduce_factor = 1
+        
+        return reduce_factor
+
+    def biobjective_search( self, reduce_factor=0.9):
+        """
+        Performs a biobjective search (fuel cost and risk cost) over the visibility graph.
+        
+        Args:
+            graph_object: The graph object containing the visibility graph, and other relevant information.
+            start_state: Identifier for the start node (default "s").
+            goal_state: Identifier for the goal node (default "g").
+            reduce_factor: A factor used in pruning dominated paths.
+            
+        Returns:
+            sols: A dict mapping each state to a list of solution tuples.
+            g2_min: A dict mapping each state to its minimum risk cost.
+        """
+        visibility_graph = self.graph_object.visibility_graph
+        max_risk_limit, acceptable_risk_limit = self.graph_object.max_risk_limit, self.graph_object.acceptable_risk_limit
+        
+        all_states = list(visibility_graph.nodes)
+        # print("All states:", all_states)
+        sols = {state: [] for state in all_states}
+        g2_min = {state: np.inf for state in all_states}
+        f1_min = {state: 0 for state in all_states}
+        open_set = []
+
+        # The start node is represented as a tuple: (f1, f2, g1, g2, state)
+        # and its parent is set to None.
+        start_node = (0, 0, 0, 0, self.start_state)
+        heapq.heappush(open_set, [start_node, (None, None, None, None, None)])
+
+        while open_set:
+            current_node, parent_node = heapq.heappop(open_set)
+            current_f1, current_f2, current_g1, current_g2, current_state = current_node
+
+            # Prune if the current risk cost is dominated
+            reduce_factor = self.reduce_factor_calc(current_state, current_f1, f1_min)
+            if (current_g2 >= reduce_factor*g2_min[current_state] or
+                current_f2 >= reduce_factor*g2_min[self.goal_state]):
+                continue
+            
+            g2_min[current_state] = current_g2
+            f1_min[current_state] = current_f1
+            sols[current_state].append([current_node, parent_node])
+
+            if current_state == "g" and current_g2 < acceptable_risk_limit:
+                return sols, g2_min
+            
+            # Stop expanding if the goal is reached
+            if current_state == self.goal_state:
+                continue
+
+            # Expand successors of the current state
+            for successor in visibility_graph.successors(current_state):
+                edge_data = visibility_graph.edges[current_state, successor]
+                g1 = current_g1 + edge_data['fuel_cost']
+                f1 = g1 + visibility_graph.nodes[successor]['heuristic_cost']["fuel_cost"]
+                g2 = current_g2 + edge_data['risk_cost']
+                # For risk, we use a zero heuristic.
+                f2 = g2 + visibility_graph.nodes[successor]['heuristic_cost']["risk_cost"]
+
+                # Prune dominated successors
+                reduce_factor = self.reduce_factor_calc(successor, f1, f1_min)
+                reduce_factor_goal = self.reduce_factor_calc(self.goal_state, f1, f1_min)
+                if (g2 >= reduce_factor * g2_min[successor] or
+                    f2 >= reduce_factor_goal * g2_min[self.goal_state]) or (current_g2 > max_risk_limit):
+                    continue
+
+                child_node = (f1, f2, g1, g2, successor)
+                heapq.heappush(open_set, [child_node, current_node])
+        
+        return sols, g2_min
 
 def extract_costs(solutions, target_state):
     """
@@ -456,8 +663,8 @@ def extract_costs(solutions, target_state):
         fuel_costs: List of fuel cost values.
         risk_costs: List of risk cost values.
     """
-    fuel_costs = [sol[0][0] for target in target_state for sol in solutions[target]]
-    risk_costs = [sol[0][1] for target in target_state for sol in solutions[target]]
+    fuel_costs = [sol[0][0] for sol in solutions[target_state]]
+    risk_costs = [sol[0][1] for sol in solutions[target_state]]
     return fuel_costs, risk_costs
 
 
@@ -517,29 +724,27 @@ def reconstruct_solution_paths(solutions, start_state="s", goal_state="g"):
     """
     solution_paths = []
     # Iterate over each solution for the goal state
-    for goal_index in goal_state:
-        print(f"goal index: {goal_index}")
-        for current_node, parent_node in solutions[goal_index]:
-            path = [current_node[-1]]  # start with the goal state
-            cost = (current_node[0], current_node[1])
-            # Traverse backward through the parent links
-            parent_state = parent_node[-1] if parent_node[4] is not None else None
-            curr_node, par_node = current_node, parent_node
-            while parent_state is not None and parent_state != start_state:
-                found = False
-                for sol in solutions[parent_state]:
-                    if sol[0] == par_node:
-                        curr_node, par_node = sol
-                        path.append(curr_node[-1])
-                        parent_state = par_node[-1]
-                        found = True
-                        break
-                if not found:
+    for current_node, parent_node in solutions[goal_state]:
+        path = [current_node[-1]]  # start with the goal state
+        cost = (current_node[0], current_node[1])
+        # Traverse backward through the parent links
+        parent_state = parent_node[-1] if parent_node[4] is not None else None
+        curr_node, par_node = current_node, parent_node
+        while parent_state is not None and parent_state != start_state:
+            found = False
+            for sol in solutions[parent_state]:
+                if sol[0] == par_node:
+                    curr_node, par_node = sol
+                    path.append(curr_node[-1])
+                    parent_state = par_node[-1]
+                    found = True
                     break
-            if par_node is not None:
-                path.append(par_node[-1])
-            path.reverse()
-            # Append the associated cost tuple at the end of the path
-            path.append(cost)
-            solution_paths.append(path)
+            if not found:
+                break
+        if par_node is not None:
+            path.append(par_node[-1])
+        path.reverse()
+        # Append the associated cost tuple at the end of the path
+        path.append(cost)
+        solution_paths.append(path)
     return solution_paths
