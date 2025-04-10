@@ -153,27 +153,28 @@ class GraphConstructionDiscretization:
         line_segment = {}
         
         # Check if the SOC requirements immediately rule out feasibility
-        if soc_j > min(self.q_max, soc_i + self.beta * distance):
-            # print(f"Entered because {soc_j} > min({self.q_max}, {soc_i} + self.beta * distance)")
+        if soc_j > min(self.q_max, soc_i + self.beta * distance) or (soc_j < soc_i - self.alpha * distance):
             return feasible, None, line_segment
-        
-        # If the drop is sufficiently steep that the whole edge is "feasible"
-        # if (soc_i - self.alpha * distance) < self.q_min and soc_j <= soc_i - self.alpha * distance:
-        if soc_j <= soc_i - self.alpha * distance:
-            # print(f"Seems to be wrong")
-            feasible = True
-            lamb = 1
-            line_segment = {"e": (0, lamb)}
+
         else:
             lamb_1 = (self.q_max - soc_i) / (self.beta * distance)
             lamb_2 = (self.q_max - soc_j) / (self.alpha * distance)
             
             if lamb_1 >= 0 and lamb_2 >= 0 and (lamb_1 + lamb_2 <= 1):
                 lamb = lamb_1 + self.alpha / (self.beta + self.alpha) * (1 - lamb_1 - lamb_2)
+                delta_SOC = self.beta / (self.beta + self.alpha) * (1 - lamb_1 - lamb_2) 
+                if soc_j - delta_SOC < self.q_min:
+                    # lamb_1_sw = lamb_1 + (soc_j - self.q_min) / (self.alpha * distance)
+                    # lamb_2_sw = lamb_1_sw + (1- lamb_1_sw) * self.alpha / (self.beta + self.alpha)
+                    feasible = False
+                    return feasible, None, line_segment
+                
                 lamb_2_sw = lamb_2 + self.beta / (self.beta + self.alpha) * (1 - lamb_1 - lamb_2)
+                
                 # Note: using the key "g" twice in a dict will override; if multiple segments are needed,
                 # consider using a list of segments.
                 line_segment = {"g": (0, lamb_1), "e": (lamb_1, lamb_2_sw), "g2": (lamb_2_sw, 1)}
+                
             else:
                 lamb = (soc_j - soc_i + self.alpha * distance) / ((self.alpha + self.beta) * distance)
                 line_segment = {"g": (0, lamb), "e": (lamb, 1)}
@@ -264,8 +265,11 @@ class GraphConstructionDiscretization:
                     feasible, lamb, line_segment = self._compute_edge_parameters(SOC_i, SOC_j, distance)
                     
                 if feasible:
+                    
                     cost = lamb * distance
+                    # print(f"SOC_i: {SOC_i} and SOC_j: {SOC_j}, line_segment: {line_segment} , pen_dist: {pen_dist} and distance {distance}")
                     risk_cost = self._compute_risk_cost(line_segment, pen_dist, distance)
+                    
                     visibility_graph.add_edge(
                         i+i_add, j+j_add,
                         node_i_info= (node_i[0], node_i[1], node_i[2], SOC_i),
@@ -403,74 +407,6 @@ class GraphConstructionDiscretization:
                 # print(f" The nodes that are assigned hueristic cost of zero are {node}")
                 self.visibility_graph.nodes[i]['heuristic_cost'] = {"fuel_cost": 0, "risk_cost": 0}
 
-def biobjective_search( graph_object, start_state, goal_state, reduce_factor=0.9):
-    """
-    Performs a biobjective search (fuel cost and risk cost) over the visibility graph.
-    
-    Args:
-        graph_object: The graph object containing the visibility graph, and other relevant information.
-        start_state: Identifier for the start node (default "s").
-        goal_state: Identifier for the goal node (default "g").
-        reduce_factor: A factor used in pruning dominated paths.
-        
-    Returns:
-        sols: A dict mapping each state to a list of solution tuples.
-        g2_min: A dict mapping each state to its minimum risk cost.
-    """
-    visibility_graph = graph_object.visibility_graph
-    max_risk_limit, acceptable_risk_limit = graph_object.max_risk_limit, graph_object.acceptable_risk_limit
-    
-    all_states = list(visibility_graph.nodes)
-    # print("All states:", all_states)
-    sols = {state: [] for state in all_states}
-    g2_min = {state: np.inf for state in all_states}
-    open_set = []
-
-    # The start node is represented as a tuple: (f1, f2, g1, g2, state)
-    # and its parent is set to None.
-    start_node = (0, 0, 0, 0, start_state)
-    heapq.heappush(open_set, [start_node, (None, None, None, None, None)])
-
-    while open_set:
-        current_node, parent_node = heapq.heappop(open_set)
-        current_f1, current_f2, current_g1, current_g2, current_state = current_node
-
-        # Prune if the current risk cost is dominated
-        if (current_g2 >= reduce_factor*g2_min[current_state] or
-            current_f2 >= reduce_factor*g2_min[goal_state]):
-            continue
-        
-        g2_min[current_state] = current_g2
-        sols[current_state].append([current_node, parent_node])
-
-        # if current_state == "g" and current_g2 < acceptable_risk_limit:
-        #     return sols, g2_min
-        
-        # Stop expanding if the goal is reached
-        if current_state == goal_state:
-            
-            continue
-
-        # Expand successors of the current state
-        for successor in visibility_graph.successors(current_state):
-            edge_data = visibility_graph.edges[current_state, successor]
-            g1 = current_g1 + edge_data['fuel_cost']
-            f1 = g1 + visibility_graph.nodes[successor]['heuristic_cost']["fuel_cost"]
-            g2 = current_g2 + edge_data['risk_cost']
-            # For risk, we use a zero heuristic.
-            f2 = g2 + visibility_graph.nodes[successor]['heuristic_cost']["risk_cost"]
-            
-            # print(f"current_state: {current_state}, successor: {successor}, heuristic: {visibility_graph.nodes[successor]['heuristic_cost']}, ")
-            # Prune dominated successors
-            if (g2 >= reduce_factor * g2_min[successor] or
-                f2 >= reduce_factor * g2_min[goal_state]) or (current_g2 > max_risk_limit):
-                continue
-
-            child_node = (f1, f2, g1, g2, successor)
-            heapq.heappush(open_set, [child_node, current_node])
-    
-    return sols, g2_min
-
 class Biobjective_search_and_heuristic_calc_class():
     """
     Contains functions for heuristic calculation and biobjective search 
@@ -496,7 +432,7 @@ class Biobjective_search_and_heuristic_calc_class():
         heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
         
         while open_list:
-            current_f2, current_g2, current_f1, current_g1, current_state = heapq.heappop(open_list)
+            current_f2, current_f1, current_g2, current_g1, current_state = heapq.heappop(open_list)
             # print(f"current state: {current_state}, current_f2: {current_f2}, current_g2: {current_g2}, current_f1: {current_f1}, current_g1: {current_g1}")
             if current_state not in closed:
                 ### Check if the current state is the goal state
@@ -523,7 +459,7 @@ class Biobjective_search_and_heuristic_calc_class():
                         ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
                         if successor_f2 < f2min[successor]:
                             f2min[successor] = successor_f2
-                            heapq.heappush(open_list, ( successor_f2, successor_g2, successor_f1, successor_g1, successor))
+                            heapq.heappush(open_list, ( successor_f2, successor_f1, successor_g2, successor_g1, successor))
                         
                 closed.append(current_state)
 
@@ -536,7 +472,7 @@ class Biobjective_search_and_heuristic_calc_class():
         heapq.heappush(open_list, (0, 0, 0, 0, self.goal_state))
         
         while open_list:
-            current_f1, current_g1, current_f2, current_g2, current_state = heapq.heappop(open_list)
+            current_f1, current_f2, current_g1, current_g2, current_state = heapq.heappop(open_list)
             # print(f"current state: {current_state}, current_f2: {current_f2}, current_g2: {current_g2}, current_f1: {current_f1}, current_g1: {current_g1}")
             if current_state not in closed:
                 ### Check if the current state is the goal state
@@ -563,7 +499,7 @@ class Biobjective_search_and_heuristic_calc_class():
                         ### The successor is in open list, but its value less than the current g1 value, update the g1min value and put it in the open list
                         if successor_f1 < f1min[successor]:
                             f1min[successor] = successor_f1
-                            heapq.heappush(open_list, ( successor_f1, successor_g1, successor_f2, successor_g2, successor))
+                            heapq.heappush(open_list, ( successor_f1, successor_f2, successor_g1, successor_g2, successor))
                         
                 closed.append(current_state)
 
@@ -572,15 +508,19 @@ class Biobjective_search_and_heuristic_calc_class():
         self.Cost_Bounded_backward_Astar_f1f2()
         self.Cost_Bounded_backward_Astar_f2f1()
     
-    def reduce_factor_calc(self, state, current_f1, f1_min):
-        if f1_min[state] != 0:
-            reduce_factor = (1 - 5*(current_f1 - f1_min[state])/current_f1)
-        else:
-            reduce_factor = 1
-        
+    def reduce_factor_calc(self, state, current_f1, f1_min, type="constant", reduce_factor_constant = 1):
+        if type == "variable":
+            if f1_min[state] != 0:
+                reduce_factor = (1 - 5*(current_f1 - f1_min[state])/current_f1)
+            else:
+                reduce_factor = 1
+            
+            return reduce_factor
+        elif type == "constant":
+            reduce_factor = reduce_factor_constant
         return reduce_factor
-
-    def biobjective_search( self, reduce_factor=0.9):
+    
+    def biobjective_search( self, type = "constant", reduce_factor_constant=0.9):
         """
         Performs a biobjective search (fuel cost and risk cost) over the visibility graph.
         
@@ -596,7 +536,7 @@ class Biobjective_search_and_heuristic_calc_class():
         """
         visibility_graph = self.graph_object.visibility_graph
         max_risk_limit, acceptable_risk_limit = self.graph_object.max_risk_limit, self.graph_object.acceptable_risk_limit
-        
+
         all_states = list(visibility_graph.nodes)
         # print("All states:", all_states)
         sols = {state: [] for state in all_states}
@@ -614,7 +554,7 @@ class Biobjective_search_and_heuristic_calc_class():
             current_f1, current_f2, current_g1, current_g2, current_state = current_node
 
             # Prune if the current risk cost is dominated
-            reduce_factor = self.reduce_factor_calc(current_state, current_f1, f1_min)
+            reduce_factor = self.reduce_factor_calc(current_state, current_f1, f1_min, type="variable", reduce_factor_constant=reduce_factor_constant)
             if (current_g2 >= reduce_factor*g2_min[current_state] or
                 current_f2 >= reduce_factor*g2_min[self.goal_state]):
                 continue
@@ -628,6 +568,7 @@ class Biobjective_search_and_heuristic_calc_class():
             
             # Stop expanding if the goal is reached
             if current_state == self.goal_state:
+                print(f"What is the current state: {current_state}, current f1 {current_f1}, current f2 {current_f2}, current g1 {current_g1}, current g2 {current_g2}")
                 continue
 
             # Expand successors of the current state
@@ -640,8 +581,9 @@ class Biobjective_search_and_heuristic_calc_class():
                 f2 = g2 + visibility_graph.nodes[successor]['heuristic_cost']["risk_cost"]
 
                 # Prune dominated successors
-                reduce_factor = self.reduce_factor_calc(successor, f1, f1_min)
-                reduce_factor_goal = self.reduce_factor_calc(self.goal_state, f1, f1_min)
+                reduce_factor = self.reduce_factor_calc(successor, f1, f1_min, type="variable", reduce_factor_constant=reduce_factor_constant)
+                reduce_factor_goal = self.reduce_factor_calc(self.goal_state, f1, f1_min, type="variable", reduce_factor_constant=reduce_factor_constant)
+                
                 if (g2 >= reduce_factor * g2_min[successor] or
                     f2 >= reduce_factor_goal * g2_min[self.goal_state]) or (current_g2 > max_risk_limit):
                     continue
@@ -748,3 +690,139 @@ def reconstruct_solution_paths(solutions, start_state="s", goal_state="g"):
         path.append(cost)
         solution_paths.append(path)
     return solution_paths
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
+import math
+
+def plot_map_with_path_and_soc(graph_object, Map_qz, start, goal, path, reverse_index_map):
+    # Create 2 subplots with equal heights in a single figure.
+    fig, (ax1, ax2) = plt.subplots(nrows=2, figsize=(10, 10), gridspec_kw={'height_ratios': [1, 1]})
+    
+    ##################################################
+    # TOP SUBPLOT: The map with the path and zones
+    ##################################################
+    
+    # Find min and max x and y for proper axis limits
+    min_x = min([
+        min(Map_qz, key=lambda x: x[0]-x[2])[0] - min(Map_qz, key=lambda x: x[0]-x[2])[2],
+        start[0], goal[0]
+    ])
+    max_x = max([
+        max(Map_qz, key=lambda x: x[0]+x[2])[0] + max(Map_qz, key=lambda x: x[0]+x[2])[2],
+        start[0], goal[0]
+    ])
+    min_y = min([
+        min(Map_qz, key=lambda x: x[1]-x[2])[1] - min(Map_qz, key=lambda x: x[1]-x[2])[2],
+        start[1], goal[1]
+    ])
+    max_y = max([
+        max(Map_qz, key=lambda x: x[1]+x[2])[1] + max(Map_qz, key=lambda x: x[1]+x[2])[2],
+        start[1], goal[1]
+    ])
+    
+    # For path segmentation, we prepare two lists for colored segments
+    path_segments_gas = []
+    path_segments_electric = []
+
+    # Iterate over the path segments to separate them by mode.
+    # In our case, we use the mode of the second point in the segment.
+    for i in range(len(path) - 1):
+        pt1 = path[i]
+        pt2 = path[i+1]
+        # Determine segment based on the mode of the second point in the segment.
+        if pt2[3] == 'g':
+            path_segments_gas.append((pt1, pt2))
+        else:
+            path_segments_electric.append((pt1, pt2))
+
+    # Plot gas segments in red and electric segments in green
+    for seg in path_segments_gas:
+        x_vals = [seg[0][0], seg[1][0]]
+        y_vals = [seg[0][1], seg[1][1]]
+        ax1.plot(x_vals, y_vals, 'r', linewidth=2, label='Gas' if 'Gas' not in [l.get_label() for l in ax1.lines] else "")
+    for seg in path_segments_electric:
+        x_vals = [seg[0][0], seg[1][0]]
+        y_vals = [seg[0][1], seg[1][1]]
+        ax1.plot(x_vals, y_vals, 'g', linewidth=2, label='Electric' if 'Electric' not in [l.get_label() for l in ax1.lines] else "")
+
+    # Draw the zones using circles
+    for circle_info in Map_qz:
+        # Outer circle (semi-transparent blue)
+        circle_outer = Circle(
+            (circle_info[0], circle_info[1]), 
+            radius=circle_info[2],
+            fill=True, 
+            facecolor=(0, 0, 1, 0.2), 
+            edgecolor='blue', 
+            linewidth=2, 
+            zorder=1
+        )
+        # Inner circle (darker)
+        circle_inner = Circle(
+            (circle_info[0], circle_info[1]), 
+            radius=circle_info[3],
+            fill=True, 
+            facecolor=(0, 0, 0, 0.5),
+            edgecolor='black', 
+            linewidth=2, 
+            zorder=2
+        )
+        ax1.add_patch(circle_outer)
+        ax1.add_patch(circle_inner)
+
+    # Plot start and goal points
+    ax1.plot(start[0], start[1], 'ro', markersize=10, label='Start')
+    ax1.plot(goal[0], goal[1], 'go', markersize=10, label='Goal')
+
+    # Set axes properties for map
+    ax1.set_xlim(min_x - (max_x - min_x)/10, max_x + (max_x - min_x)/10)
+    ax1.set_ylim(min_y - (max_y - min_y)/10, max_y + (max_y - min_y)/10)
+    ax1.set_aspect('equal', 'box')
+    ax1.set_title("Pareto Optimal Paths")
+    ax1.grid(True)
+    ax1.legend()
+
+    ##################################################
+    # BOTTOM SUBPLOT: SOC vs. Distance traveled, with colors by mode.
+    ##################################################
+    
+    # Compute cumulative distance traveled for each point.
+    cumulative_distance = [0.0]  # starting with distance 0 at the first point
+    for i in range(1, len(path)):
+        x_prev, y_prev = path[i-1][0], path[i-1][1]
+        x_curr, y_curr = path[i][0], path[i][1]
+        seg_distance = math.sqrt((x_curr - x_prev)**2 + (y_curr - y_prev)**2)
+        cumulative_distance.append(cumulative_distance[-1] + seg_distance)
+
+    # Plot each SOC segment according to the mode.
+    # We use the same segmentation as above: for the segment from i to i+1, the mode is in path[i+1][3].
+    for i in range(len(path)-1):
+        d_start = cumulative_distance[i]
+        d_end = cumulative_distance[i+1]
+        soc_start = path[i][2]
+        soc_end = path[i+1][2]
+        
+        # Determine color based on mode at the second point of the segment.
+        color = 'r' if path[i+1][3] == 'g' else 'g'
+        # Plot the line segment with markers.
+        ax2.plot([d_start, d_end], [soc_start, soc_end], color=color, linewidth=2,
+                 marker='o', markersize=5,
+                 label='Gas' if (color=='r' and 'Gas' not in [line.get_label() for line in ax2.lines])
+                        else ('Electric' if (color=='g' and 'Electric' not in [line.get_label() for line in ax2.lines])
+                              else ""))
+        
+    # Set labels and title for the SOC plot
+    ax2.set_xlabel("Distance Traveled")
+    ax2.set_ylabel("SOC")
+    ax2.set_title("SOC vs. Distance Traveled")
+    ax2.grid(True)
+
+    # Adjust layout to ensure both subplots are of equal size and well spaced.
+    plt.tight_layout()
+    plt.show()
+
+# Example usage:
+# graph_object, Map_qz, start, goal, path, reverse_index_map = ... (define these)
+# plot_map_with_path_and_soc(graph_object, Map_qz, start, goal, path, reverse_index_map)
+
